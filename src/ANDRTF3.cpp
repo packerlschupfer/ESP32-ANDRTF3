@@ -36,7 +36,9 @@ ANDRTF3::ANDRTF3(uint8_t address)
       _connected(false),
       _asyncStartTime(0),
       _temperaturePtr(nullptr),
-      _validityPtr(nullptr) {
+      _validityPtr(nullptr),
+      _consecutive0x0000Errors(0),
+      _lastErrorTime(0) {
     // _asyncPending is initialized via in-class initializer (std::atomic<bool>{false})
 
     _config = getDefaultConfig();
@@ -45,13 +47,13 @@ ANDRTF3::ANDRTF3(uint8_t address)
     _lastReading.celsius = 0;
     _lastReading.timestamp = 0;
     _lastReading.valid = false;
-    
-    ANDRTF3_LOG_D("Constructor: Init celsius=%d, valid=%d", 
+
+    ANDRTF3_LOG_D("Constructor: Init celsius=%d, valid=%d",
                   _lastReading.celsius, _lastReading.valid);
-    
+
     // Set init phase for proper operation
     setInitPhase(InitPhase::READY);
-    
+
     // Register device with ModbusDevice framework
     registerDevice();
 }
@@ -107,11 +109,24 @@ bool ANDRTF3::requestTemperature() {
 
     // Check for error codes
     if (rawValue == 0 || values[0] == 0xFFFF) {
-        ANDRTF3_LOG_E("ERROR: Received 0x%04X - sensor error or communication fault!", values[0]);
+        _consecutive0x0000Errors++;
+
+        // Natural retry strategy: Use 5-second ModbusCoordinator tick interval
+        // First error: silent (wait for next poll to confirm)
+        // Second+ error: log ERROR (persistent fault confirmed)
+        if (_consecutive0x0000Errors >= 2) {
+            ANDRTF3_LOG_E("ERROR: Persistent 0x%04X (%d consecutive) - sensor fault confirmed",
+                          values[0], _consecutive0x0000Errors);
+        } else {
+            // First error: silent tracking (coordinator will retry in 5 seconds)
+            ANDRTF3_LOG_D("First 0x%04X detected - will verify on next poll (5s)", values[0]);
+        }
+
         _asyncPending.store(false);
         _lastReading.valid = false;
         _lastReading.error = (values[0] == 0xFFFF) ? "Modbus error 0xFFFF" : "Sensor returned 0x0000";
-        _connected = false;
+        _connected = (_consecutive0x0000Errors < 3);  // Only disconnect after 3+ consecutive errors
+        _lastErrorTime = millis();
         return false;
     }
 
@@ -130,6 +145,7 @@ bool ANDRTF3::requestTemperature() {
     _lastReading.valid = true;
     _lastReading.error = "";
     _connected = true;
+    _consecutive0x0000Errors = 0;  // Reset error counter on success
 
     // Update bound pointers
     if (_temperaturePtr != nullptr) {
@@ -188,18 +204,31 @@ bool ANDRTF3::performRead() {
     }
     
     int16_t rawValue = static_cast<int16_t>(values[0]);
-    
-    ANDRTF3_LOG_D("performRead: raw uint16=0x%04X (%u), as int16=%d", 
+
+    ANDRTF3_LOG_D("performRead: raw uint16=0x%04X (%u), as int16=%d",
                   values[0], values[0], rawValue);
-    
+
     // Check for Modbus error codes:
     // 0x0000 = Sensor error or communication fault
     // 0xFFFF = Common Modbus error/no response (-1 as signed)
     if (rawValue == 0 || values[0] == 0xFFFF) {
-        ANDRTF3_LOG_E("ERROR: Received 0x%04X - sensor error or communication fault!", values[0]);
+        _consecutive0x0000Errors++;
+
+        // Natural retry strategy: Use 5-second ModbusCoordinator tick interval
+        // First error: silent (wait for next poll to confirm)
+        // Second+ error: log ERROR (persistent fault confirmed)
+        if (_consecutive0x0000Errors >= 2) {
+            ANDRTF3_LOG_E("ERROR: Persistent 0x%04X (%d consecutive) - sensor fault confirmed",
+                          values[0], _consecutive0x0000Errors);
+        } else {
+            // First error: silent tracking (coordinator will retry in 5 seconds)
+            ANDRTF3_LOG_D("First 0x%04X detected - will verify on next poll (5s)", values[0]);
+        }
+
         _lastReading.valid = false;
         _lastReading.error = (values[0] == 0xFFFF) ? "Modbus error 0xFFFF" : "Sensor returned 0x0000";
-        _connected = false;
+        _connected = (_consecutive0x0000Errors < 3);  // Only disconnect after 3+ consecutive errors
+        _lastErrorTime = millis();
         // Do NOT update celsius value - keep previous reading
         return false;
     }
@@ -218,7 +247,8 @@ bool ANDRTF3::performRead() {
     _lastReading.valid = true;
     _lastReading.error = "";
     _connected = true;
-    
+    _consecutive0x0000Errors = 0;  // Reset error counter on success
+
     return true;
 }
 
@@ -291,12 +321,16 @@ void ANDRTF3::onAsyncResponse(uint8_t functionCode, uint16_t address,
         // 0xFFFF = Common Modbus error/no response
         uint16_t unsignedValue = static_cast<uint16_t>(rawValue);
         if (rawValue == 0 || unsignedValue == 0xFFFF) {
-            ANDRTF3_LOG_E("ERROR: Received 0x%04X - sensor error or communication fault!", unsignedValue);
+            _consecutive0x0000Errors++;
+            ANDRTF3_LOG_E("ERROR: Received 0x%04X (%d consecutive) - sensor error or communication fault!",
+                          unsignedValue, _consecutive0x0000Errors);
             _lastReading.valid = false;
             _lastReading.error = (unsignedValue == 0xFFFF) ? "Modbus error 0xFFFF" : "Sensor returned 0x0000";
-            _connected = false;
+            _connected = (_consecutive0x0000Errors < 3);  // Only disconnect after 3+ consecutive errors
+            _lastErrorTime = millis();
             // Do NOT update celsius value - keep previous reading
         } else {
+            _consecutive0x0000Errors = 0;  // Reset error counter on success
             handleReadComplete(true, rawValue);
         }
     } else {

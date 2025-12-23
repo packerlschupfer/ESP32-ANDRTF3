@@ -104,7 +104,11 @@ private:
     // Unified mapping architecture (simple binding)
     int16_t* _temperaturePtr;  // Pointer to tenths of degrees (Temperature_t)
     bool* _validityPtr;
-    
+
+    // Error tracking for smart retry
+    uint8_t _consecutive0x0000Errors;
+    uint32_t _lastErrorTime;
+
     // Internal methods
     bool performRead();
     void handleReadComplete(bool success, int16_t value);
